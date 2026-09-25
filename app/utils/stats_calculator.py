@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
@@ -91,13 +91,18 @@ def calculate_group_stats(graduates: List[Graduate]) -> GroupStats:
     )
 
 
-def get_comparison_stats(
+def _scoped_graduates(
     db: Session,
-    graduation_year: int = None,
-    college_id: int = None,
-    micro_major_id: int = None
-) -> ComparisonStats:
-    query = db.query(Graduate)
+    scope,
+    graduation_year: Optional[int] = None,
+    college_id: Optional[int] = None,
+) -> List[Graduate]:
+    """按调用方授权范围取毕业生：学院角色在此被强制叠加学院过滤。
+
+    显式的 college_id / micro_major_id 合法性由 API 层先行校验（越权即 403），
+    这里再次以范围条件收口，保证任何调用路径都不会绕出授权学院。
+    """
+    query = scope.graduate_base_query(db)
 
     filters = []
     if graduation_year:
@@ -108,10 +113,12 @@ def get_comparison_stats(
     if filters:
         query = query.filter(and_(*filters))
 
-    all_graduates = query.all()
+    graduates = query.all()
+    _eager_load_follow_ups(db, graduates)
+    return graduates
 
-    _eager_load_follow_ups(db, all_graduates)
 
+def _split_micro_groups(all_graduates, micro_major_id: Optional[int]):
     if micro_major_id:
         with_micro = [
             g for g in all_graduates
@@ -124,6 +131,23 @@ def get_comparison_stats(
     else:
         with_micro = [g for g in all_graduates if g.has_micro_major]
         without_micro = [g for g in all_graduates if not g.has_micro_major]
+    return with_micro, without_micro
+
+
+def get_comparison_stats(
+    db: Session,
+    graduation_year: int = None,
+    college_id: int = None,
+    micro_major_id: int = None,
+    scope=None,
+) -> ComparisonStats:
+    if scope is None:
+        from app.core.security import AccessScope
+        scope = AccessScope.school()
+
+    all_graduates = _scoped_graduates(db, scope, graduation_year, college_id)
+
+    with_micro, without_micro = _split_micro_groups(all_graduates, micro_major_id)
 
     return ComparisonStats(
         with_micro=calculate_group_stats(with_micro),
@@ -135,35 +159,16 @@ def get_follow_up_comparison(
     db: Session,
     graduation_year: int = None,
     college_id: int = None,
-    micro_major_id: int = None
+    micro_major_id: int = None,
+    scope=None,
 ) -> FollowUpComparisonStats:
-    query = db.query(Graduate)
+    if scope is None:
+        from app.core.security import AccessScope
+        scope = AccessScope.school()
 
-    filters = []
-    if graduation_year:
-        filters.append(Graduate.graduation_year == graduation_year)
-    if college_id:
-        filters.append(Graduate.college_id == college_id)
+    all_graduates = _scoped_graduates(db, scope, graduation_year, college_id)
 
-    if filters:
-        query = query.filter(and_(*filters))
-
-    all_graduates = query.all()
-
-    _eager_load_follow_ups(db, all_graduates)
-
-    if micro_major_id:
-        with_micro = [
-            g for g in all_graduates
-            if g.has_micro_major and g.micro_major_id == micro_major_id
-        ]
-        without_micro = [
-            g for g in all_graduates
-            if not g.has_micro_major
-        ]
-    else:
-        with_micro = [g for g in all_graduates if g.has_micro_major]
-        without_micro = [g for g in all_graduates if not g.has_micro_major]
+    with_micro, without_micro = _split_micro_groups(all_graduates, micro_major_id)
 
     return FollowUpComparisonStats(
         with_micro=calculate_group_stats(with_micro),

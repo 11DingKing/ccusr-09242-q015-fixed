@@ -3,6 +3,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core import get_db
+from app.core.security import (
+    AccessScope,
+    require_read_scope,
+    require_school_scope,
+    ensure_graduate_accessible,
+)
 from app.models import Graduate, EmployerFollowUp
 from app.schemas import (
     EmployerFollowUp as FollowUpSchema,
@@ -15,6 +21,14 @@ from app.schemas import (
 router = APIRouter(prefix="/follow-ups", tags=["用人单位回访"])
 
 
+def _get_follow_up_in_scope(db: Session, scope: AccessScope, follow_up_id: int) -> EmployerFollowUp:
+    follow_up = db.query(EmployerFollowUp).filter(EmployerFollowUp.id == follow_up_id).first()
+    if follow_up is None:
+        raise HTTPException(status_code=404, detail="回访记录不存在")
+    ensure_graduate_accessible(scope, db, follow_up.graduate_id)
+    return follow_up
+
+
 @router.get("", response_model=List[FollowUpSchema])
 def list_follow_ups(
     graduate_id: Optional[int] = Query(None, description="毕业生ID"),
@@ -22,10 +36,18 @@ def list_follow_ups(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
-    query = db.query(EmployerFollowUp)
+    # 先限定到授权范围内的毕业生，防止借 graduate_id 遍历其他学院明细。
+    query = db.query(EmployerFollowUp).join(
+        Graduate, EmployerFollowUp.graduate_id == Graduate.id
+    )
+    if scope.is_college:
+        query = query.filter(Graduate.college_id.in_(tuple(scope.college_ids)))
 
     if graduate_id:
+        # 显式毕业生参数越权即 403。
+        ensure_graduate_accessible(scope, db, int(graduate_id))
         query = query.filter(EmployerFollowUp.graduate_id == graduate_id)
     if is_still_employed is not None:
         query = query.filter(EmployerFollowUp.is_still_employed == is_still_employed)
@@ -36,7 +58,12 @@ def list_follow_ups(
 
 
 @router.post("", response_model=FollowUpSchema)
-def create_follow_up(follow_up_in: EmployerFollowUpCreate, db: Session = Depends(get_db)):
+def create_follow_up(
+    follow_up_in: EmployerFollowUpCreate,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    require_school_scope(scope)
     graduate = db.query(Graduate).filter(Graduate.id == follow_up_in.graduate_id).first()
     if not graduate:
         raise HTTPException(status_code=404, detail="毕业生不存在")
@@ -53,11 +80,12 @@ def create_follow_up(follow_up_in: EmployerFollowUpCreate, db: Session = Depends
 
 
 @router.get("/{follow_up_id}", response_model=FollowUpSchema)
-def get_follow_up(follow_up_id: int, db: Session = Depends(get_db)):
-    follow_up = db.query(EmployerFollowUp).filter(EmployerFollowUp.id == follow_up_id).first()
-    if not follow_up:
-        raise HTTPException(status_code=404, detail="回访记录不存在")
-    return follow_up
+def get_follow_up(
+    follow_up_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    return _get_follow_up_in_scope(db, scope, follow_up_id)
 
 
 @router.put("/{follow_up_id}", response_model=FollowUpSchema)
@@ -65,7 +93,9 @@ def update_follow_up(
     follow_up_id: int,
     follow_up_in: EmployerFollowUpUpdate,
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
+    require_school_scope(scope)
     follow_up = db.query(EmployerFollowUp).filter(EmployerFollowUp.id == follow_up_id).first()
     if not follow_up:
         raise HTTPException(status_code=404, detail="回访记录不存在")
@@ -86,7 +116,12 @@ def update_follow_up(
 
 
 @router.delete("/{follow_up_id}")
-def delete_follow_up(follow_up_id: int, db: Session = Depends(get_db)):
+def delete_follow_up(
+    follow_up_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    require_school_scope(scope)
     follow_up = db.query(EmployerFollowUp).filter(EmployerFollowUp.id == follow_up_id).first()
     if not follow_up:
         raise HTTPException(status_code=404, detail="回访记录不存在")
@@ -97,10 +132,12 @@ def delete_follow_up(follow_up_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/graduate/{graduate_id}/timeline", response_model=FollowUpTimeline)
-def get_follow_up_timeline(graduate_id: int, db: Session = Depends(get_db)):
-    graduate = db.query(Graduate).filter(Graduate.id == graduate_id).first()
-    if not graduate:
-        raise HTTPException(status_code=404, detail="毕业生不存在")
+def get_follow_up_timeline(
+    graduate_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    graduate = ensure_graduate_accessible(scope, db, graduate_id)
 
     follow_ups = db.query(EmployerFollowUp).filter(
         EmployerFollowUp.graduate_id == graduate_id

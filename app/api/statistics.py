@@ -1,25 +1,31 @@
-from typing import Optional, List, Dict
+from typing import Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
 from collections import Counter
 
 from app.core import get_db
+from app.core.security import (
+    AccessScope,
+    require_read_scope,
+    require_school_scope,
+    enforce_query_filters,
+    ensure_micro_major_accessible,
+    ensure_target_accessible,
+    accessible_warning_ids,
+    mint_report_link,
+    verify_report_link,
+)
 from app.models import (
     Graduate,
     College,
     MicroMajor,
-    EmployerFollowUp,
     DestinationStatus,
     DestinationType,
     Warning,
     WarningStatus,
-    WarningLevel,
-    WarningType,
     AttributionRecord,
     AttributionCategory,
-    ProvinceReferenceLine,
 )
 from app.schemas import (
     ComparisonStats,
@@ -37,15 +43,25 @@ from app.utils import (
     get_comparison_stats,
     get_follow_up_comparison,
     calculate_group_stats,
-    format_salary_display,
-    _format_satisfaction,
-    _format_retention,
     run_warning_detection_for_target,
     calculate_yearly_indicators,
 )
 from app.utils.stats_calculator import _eager_load_follow_ups
 
 router = APIRouter(prefix="/statistics", tags=["统计分析"])
+
+REPORT_BY_COLLEGE = "by-college"
+REPORT_BY_MICRO_MAJOR = "by-micro-major"
+REPORT_BY_YEAR = "by-year"
+REPORT_BY_EMPLOYER_FOLLOW_UP = "by-employer-follow-up"
+REPORT_WARNINGS = "warnings"
+REPORT_ATTRIBUTION_DISTRIBUTION = "attribution-distribution"
+
+
+def _check_link(link: Optional[str], scope: AccessScope, report_type: str) -> None:
+    """携带已生成的报告链接访问时，按调用方当前权限重新校验。"""
+    if link:
+        verify_report_link(link, scope, report_type)
 
 
 @router.get("/comparison", response_model=ComparisonStats)
@@ -54,12 +70,18 @@ def get_group_comparison(
     college_id: Optional[int] = Query(None, description="学院ID"),
     micro_major_id: Optional[int] = Query(None, description="微专业ID"),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
+    # 显式传入的学院/微专业参数越权即 403，不返回易误解的空数据。
+    enforce_query_filters(
+        scope, db, college_id=college_id, micro_major_id=micro_major_id
+    )
     return get_comparison_stats(
         db=db,
         graduation_year=graduation_year,
         college_id=college_id,
-        micro_major_id=micro_major_id
+        micro_major_id=micro_major_id,
+        scope=scope,
     )
 
 
@@ -69,12 +91,17 @@ def get_follow_up_group_comparison(
     college_id: Optional[int] = Query(None, description="学院ID"),
     micro_major_id: Optional[int] = Query(None, description="微专业ID"),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
+    enforce_query_filters(
+        scope, db, college_id=college_id, micro_major_id=micro_major_id
+    )
     return get_follow_up_comparison(
         db=db,
         graduation_year=graduation_year,
         college_id=college_id,
         micro_major_id=micro_major_id,
+        scope=scope,
     )
 
 
@@ -83,31 +110,43 @@ def get_yearly_trend(
     micro_major_id: int,
     run_detection: bool = Query(False, description="是否先运行预警检测"),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
-    micro_major = db.query(MicroMajor).filter(MicroMajor.id == micro_major_id).first()
-    if not micro_major:
-        raise HTTPException(status_code=404, detail="微专业不存在")
+    # 趋势接口按路径参数定位微专业，越权直接拒绝。
+    micro_major = ensure_micro_major_accessible(scope, db, micro_major_id)
 
     if run_detection:
+        require_school_scope(scope)
         run_warning_detection_for_target(db, "micro_major", micro_major_id)
 
-    active_warnings = db.query(Warning).filter(
-        Warning.target_type == "micro_major",
-        Warning.target_id == micro_major_id,
-        Warning.status == WarningStatus.ACTIVE,
+    active_warnings = scope.apply_warning_filter(
+        db.query(Warning).filter(
+            Warning.target_type == "micro_major",
+            Warning.target_id == micro_major_id,
+            Warning.status == WarningStatus.ACTIVE,
+        ),
+        db,
     ).all()
 
-    years = db.query(Graduate.graduation_year).distinct().order_by(
-        Graduate.graduation_year
-    ).all()
-    years = [y[0] for y in years]
+    # 届次清单与对照组（未修读）都限定在调用方范围内，
+    # 学院角色拿不到其他学院的届次规模与对照率。
+    years = [
+        row[0]
+        for row in scope.graduate_base_query(db)
+        .with_entities(Graduate.graduation_year)
+        .distinct()
+        .order_by(Graduate.graduation_year)
+        .all()
+    ]
 
-    yearly_indicators = calculate_yearly_indicators(db, "micro_major", micro_major_id)
+    yearly_indicators = calculate_yearly_indicators(
+        db, "micro_major", micro_major_id, scope=scope
+    )
     indicator_map = {d["year"]: d for d in yearly_indicators}
 
     trend = []
     for year in years:
-        all_graduates = db.query(Graduate).filter(
+        all_graduates = scope.graduate_base_query(db).filter(
             Graduate.graduation_year == year
         ).all()
 
@@ -161,13 +200,37 @@ def get_yearly_trend(
     )
 
 
+@router.get("/reports/link")
+def create_report_link(
+    report_type: str = Query(..., description="报告类型"),
+    ttl_seconds: int = Query(7 * 24 * 3600, ge=60, le=30 * 24 * 3600),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    """生成绑定调用方当前角色与学院范围的签名报告链接。"""
+    token = mint_report_link(report_type, scope, ttl_seconds=ttl_seconds)
+    return {
+        "report_type": report_type,
+        "link": token,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
 @router.get("/reports/by-college", response_model=ReportResponse)
-def get_report_by_college(db: Session = Depends(get_db)):
-    colleges = db.query(College).all()
+def get_report_by_college(
+    link: Optional[str] = Query(None, description="已生成的签名报告链接"),
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    _check_link(link, scope, REPORT_BY_COLLEGE)
+
+    colleges_query = db.query(College)
+    if scope.is_college:
+        colleges_query = colleges_query.filter(College.id.in_(tuple(scope.college_ids)))
+    colleges = colleges_query.order_by(College.id).all()
     data = []
 
     for college in colleges:
-        graduates = db.query(Graduate).filter(
+        graduates = scope.graduate_base_query(db).filter(
             Graduate.college_id == college.id
         ).all()
         _eager_load_follow_ups(db, graduates)
@@ -193,11 +256,22 @@ def get_report_by_college(db: Session = Depends(get_db)):
 
 
 @router.get("/reports/by-micro-major", response_model=ReportResponse)
-def get_report_by_micro_major(db: Session = Depends(get_db)):
-    micro_majors = db.query(MicroMajor).all()
+def get_report_by_micro_major(
+    link: Optional[str] = Query(None, description="已生成的签名报告链接"),
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    _check_link(link, scope, REPORT_BY_MICRO_MAJOR)
+
+    mm_query = db.query(MicroMajor)
+    if scope.is_college:
+        mm_query = mm_query.filter(MicroMajor.college_id.in_(tuple(scope.college_ids)))
+    micro_majors = mm_query.order_by(MicroMajor.id).all()
     data = []
 
-    all_without_micro = db.query(Graduate).filter(
+    # “未修读微专业”对照组同样限定在授权范围内，
+    # 学院角色看到的是本学院对照组，而非全校汇总。
+    all_without_micro = scope.graduate_base_query(db).filter(
         Graduate.has_micro_major == False
     ).all()
     _eager_load_follow_ups(db, all_without_micro)
@@ -215,7 +289,7 @@ def get_report_by_micro_major(db: Session = Depends(get_db)):
     ))
 
     for mm in micro_majors:
-        graduates = db.query(Graduate).filter(
+        graduates = scope.graduate_base_query(db).filter(
             Graduate.micro_major_id == mm.id,
             Graduate.has_micro_major == True
         ).all()
@@ -242,15 +316,25 @@ def get_report_by_micro_major(db: Session = Depends(get_db)):
 
 
 @router.get("/reports/by-year", response_model=ReportResponse)
-def get_report_by_year(db: Session = Depends(get_db)):
-    years = db.query(Graduate.graduation_year).distinct().order_by(
-        Graduate.graduation_year
-    ).all()
-    years = [y[0] for y in years]
+def get_report_by_year(
+    link: Optional[str] = Query(None, description="已生成的签名报告链接"),
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    _check_link(link, scope, REPORT_BY_YEAR)
+
+    years = [
+        row[0]
+        for row in scope.graduate_base_query(db)
+        .with_entities(Graduate.graduation_year)
+        .distinct()
+        .order_by(Graduate.graduation_year)
+        .all()
+    ]
     data = []
 
     for year in years:
-        graduates = db.query(Graduate).filter(
+        graduates = scope.graduate_base_query(db).filter(
             Graduate.graduation_year == year
         ).all()
         _eager_load_follow_ups(db, graduates)
@@ -276,8 +360,14 @@ def get_report_by_year(db: Session = Depends(get_db)):
 
 
 @router.get("/reports/by-employer-follow-up", response_model=ReportResponse)
-def get_report_by_employer_follow_up(db: Session = Depends(get_db)):
-    employed_graduates = db.query(Graduate).filter(
+def get_report_by_employer_follow_up(
+    link: Optional[str] = Query(None, description="已生成的签名报告链接"),
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    _check_link(link, scope, REPORT_BY_EMPLOYER_FOLLOW_UP)
+
+    employed_graduates = scope.graduate_base_query(db).filter(
         Graduate.destination_type == DestinationType.EMPLOYMENT
     ).all()
     _eager_load_follow_ups(db, employed_graduates)
@@ -325,12 +415,21 @@ def get_warning_report(
     status: Optional[str] = Query(None, description="预警状态：预警中/已解决/已忽略"),
     warning_level: Optional[str] = Query(None, description="预警级别"),
     target_type: Optional[str] = Query(None, description="预警对象类型：micro_major/college"),
+    target_id: Optional[int] = Query(None, description="预警对象ID"),
     run_detection: bool = Query(False, description="是否先运行全量预警检测"),
+    link: Optional[str] = Query(None, description="已生成的签名报告链接"),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
+    _check_link(link, scope, REPORT_WARNINGS)
+
     if run_detection:
+        require_school_scope(scope)
         from app.utils import run_full_warning_detection
         run_full_warning_detection(db)
+
+    # target_type/target_id 越权即 403，而不是被下面的范围过滤悄悄清空。
+    ensure_target_accessible(scope, db, target_type, target_id)
 
     query = db.query(Warning)
 
@@ -340,14 +439,20 @@ def get_warning_report(
         query = query.filter(Warning.warning_level == warning_level)
     if target_type:
         query = query.filter(Warning.target_type == target_type)
+    if target_id:
+        query = query.filter(Warning.target_id == target_id)
+
+    # 学院角色强制只看本学院（含所属微专业）的预警。
+    query = scope.apply_warning_filter(query, db)
 
     warnings = query.order_by(
         Warning.warning_level.desc(),
         Warning.created_at.desc(),
     ).all()
 
-    active_count = db.query(Warning).filter(Warning.status == WarningStatus.ACTIVE).count()
-    resolved_count = db.query(Warning).filter(Warning.status == WarningStatus.RESOLVED).count()
+    count_query = scope.apply_warning_filter(db.query(Warning), db)
+    active_count = count_query.filter(Warning.status == WarningStatus.ACTIVE).count()
+    resolved_count = count_query.filter(Warning.status == WarningStatus.RESOLVED).count()
 
     data = []
     for w in warnings:
@@ -385,12 +490,30 @@ def get_warning_report(
 @router.get("/reports/attribution-distribution", response_model=AttributionDistributionResponse)
 def get_attribution_distribution_report(
     target_type: Optional[str] = Query(None, description="对象类型：micro_major/college"),
+    target_id: Optional[int] = Query(None, description="对象ID"),
+    link: Optional[str] = Query(None, description="已生成的签名报告链接"),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
-    query = db.query(AttributionRecord)
+    _check_link(link, scope, REPORT_ATTRIBUTION_DISTRIBUTION)
 
-    if target_type:
-        warning_query = db.query(Warning.id).filter(Warning.target_type == target_type)
+    ensure_target_accessible(scope, db, target_type, target_id)
+
+    # 归因记录经预警归属间接越权，必须先收敛到可访问的预警集合。
+    allowed_warning_ids = accessible_warning_ids(scope, db)
+    if not allowed_warning_ids:
+        query = db.query(AttributionRecord).filter(False)
+    else:
+        query = db.query(AttributionRecord).filter(
+            AttributionRecord.warning_id.in_(allowed_warning_ids)
+        )
+
+    if target_type or target_id:
+        warning_query = db.query(Warning.id).filter(Warning.id.in_(allowed_warning_ids or [0]))
+        if target_type:
+            warning_query = warning_query.filter(Warning.target_type == target_type)
+        if target_id:
+            warning_query = warning_query.filter(Warning.target_id == target_id)
         warning_ids = [w[0] for w in warning_query.all()]
         if warning_ids:
             query = query.filter(AttributionRecord.warning_id.in_(warning_ids))

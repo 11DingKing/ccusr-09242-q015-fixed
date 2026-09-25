@@ -4,7 +4,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
 from app.core import get_db
-from app.models import Graduate, StatusChangeLog, DestinationStatus, DestinationType
+from app.core.security import (
+    AccessScope,
+    require_read_scope,
+    require_school_scope,
+    enforce_query_filters,
+    ensure_graduate_accessible,
+)
+from app.models import Graduate, StatusChangeLog, DestinationStatus
 from app.schemas import (
     Graduate as GraduateSchema,
     GraduateCreate,
@@ -26,8 +33,15 @@ def list_graduates(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
-    query = db.query(Graduate)
+    # 显式范围参数越权即 403，不返回空列表掩盖越权意图。
+    enforce_query_filters(
+        scope, db, college_id=college_id, micro_major_id=micro_major_id
+    )
+
+    # 数据层强制按授权学院收口。
+    query = scope.graduate_base_query(db)
 
     filters = []
     if graduation_year:
@@ -55,7 +69,12 @@ def list_graduates(
 
 
 @router.post("", response_model=GraduateSchema)
-def create_graduate(graduate_in: GraduateCreate, db: Session = Depends(get_db)):
+def create_graduate(
+    graduate_in: GraduateCreate,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    require_school_scope(scope)
     existing = db.query(Graduate).filter(Graduate.student_id == graduate_in.student_id).first()
     if existing:
         raise HTTPException(status_code=400, detail="该学号已存在")
@@ -78,15 +97,22 @@ def create_graduate(graduate_in: GraduateCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{graduate_id}", response_model=GraduateSchema)
-def get_graduate(graduate_id: int, db: Session = Depends(get_db)):
-    graduate = db.query(Graduate).filter(Graduate.id == graduate_id).first()
-    if not graduate:
-        raise HTTPException(status_code=404, detail="毕业生不存在")
-    return graduate
+def get_graduate(
+    graduate_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    return ensure_graduate_accessible(scope, db, graduate_id)
 
 
 @router.put("/{graduate_id}", response_model=GraduateSchema)
-def update_graduate(graduate_id: int, graduate_in: GraduateUpdate, db: Session = Depends(get_db)):
+def update_graduate(
+    graduate_id: int,
+    graduate_in: GraduateUpdate,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    require_school_scope(scope)
     graduate = db.query(Graduate).filter(Graduate.id == graduate_id).first()
     if not graduate:
         raise HTTPException(status_code=404, detail="毕业生不存在")
@@ -101,7 +127,12 @@ def update_graduate(graduate_id: int, graduate_in: GraduateUpdate, db: Session =
 
 
 @router.delete("/{graduate_id}")
-def delete_graduate(graduate_id: int, db: Session = Depends(get_db)):
+def delete_graduate(
+    graduate_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    require_school_scope(scope)
     graduate = db.query(Graduate).filter(Graduate.id == graduate_id).first()
     if not graduate:
         raise HTTPException(status_code=404, detail="毕业生不存在")
@@ -117,7 +148,9 @@ def update_status(
     graduate_id: int,
     status_in: StatusUpdateRequest,
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
+    require_school_scope(scope)
     graduate = db.query(Graduate).filter(Graduate.id == graduate_id).first()
     if not graduate:
         raise HTTPException(status_code=404, detail="毕业生不存在")
@@ -143,10 +176,12 @@ def update_status(
 
 
 @router.get("/{graduate_id}/status-logs", response_model=List[StatusLogSchema])
-def get_status_logs(graduate_id: int, db: Session = Depends(get_db)):
-    graduate = db.query(Graduate).filter(Graduate.id == graduate_id).first()
-    if not graduate:
-        raise HTTPException(status_code=404, detail="毕业生不存在")
+def get_status_logs(
+    graduate_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    ensure_graduate_accessible(scope, db, graduate_id)
 
     return db.query(StatusChangeLog).filter(
         StatusChangeLog.graduate_id == graduate_id

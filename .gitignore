@@ -19,3 +19,6 @@ __pycache__/
 .mypy_cache/
 vendor/
 .phpunit.result.cache
+
+# 本地虚拟环境
+.venv/

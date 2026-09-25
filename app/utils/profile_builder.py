@@ -98,8 +98,12 @@ def build_profile_stats(
     db: Session,
     target_type: str,
     target_id: int,
+    scope=None,
 ) -> ProfileStats:
-    query = db.query(Graduate)
+    if scope is not None:
+        query = scope.graduate_base_query(db)
+    else:
+        query = db.query(Graduate)
     if target_type == "micro_major":
         query = query.filter(
             Graduate.has_micro_major == True,
@@ -112,7 +116,7 @@ def build_profile_stats(
     _eager_load_follow_ups(db, all_graduates)
     overall_stats = calculate_group_stats(all_graduates)
 
-    yearly_data = calculate_yearly_indicators(db, target_type, target_id)
+    yearly_data = calculate_yearly_indicators(db, target_type, target_id, scope=scope)
 
     active_warnings = db.query(Warning).filter(
         Warning.target_type == target_type,
@@ -183,10 +187,11 @@ def build_key_indicators_comparison(
     db: Session,
     target_type: str,
     target_id: int,
+    scope=None,
 ) -> "KeyIndicatorsComparison":
     from app.schemas import KeyIndicatorsComparison
 
-    yearly_data = calculate_yearly_indicators(db, target_type, target_id)
+    yearly_data = calculate_yearly_indicators(db, target_type, target_id, scope=scope)
     if not yearly_data:
         return KeyIndicatorsComparison(
             confirmed_rate={},
@@ -241,15 +246,18 @@ def build_key_indicators_comparison(
 def build_micro_major_profile(
     db: Session,
     micro_major_id: int,
+    scope=None,
 ) -> Optional[MicroMajorProfile]:
     micro_major = db.query(MicroMajor).filter(MicroMajor.id == micro_major_id).first()
     if not micro_major:
         return None
 
-    stats = build_profile_stats(db, "micro_major", micro_major_id)
+    stats = build_profile_stats(db, "micro_major", micro_major_id, scope=scope)
     warnings = build_warning_summary(db, "micro_major", micro_major_id)
     attributions = build_attribution_summary(db, "micro_major", micro_major_id)
-    key_indicators = build_key_indicators_comparison(db, "micro_major", micro_major_id)
+    key_indicators = build_key_indicators_comparison(
+        db, "micro_major", micro_major_id, scope=scope
+    )
 
     return MicroMajorProfile(
         id=micro_major.id,
@@ -268,15 +276,18 @@ def build_micro_major_profile(
 def build_college_profile(
     db: Session,
     college_id: int,
+    scope=None,
 ) -> Optional[CollegeProfile]:
     college = db.query(College).filter(College.id == college_id).first()
     if not college:
         return None
 
-    stats = build_profile_stats(db, "college", college_id)
+    stats = build_profile_stats(db, "college", college_id, scope=scope)
     warnings = build_warning_summary(db, "college", college_id)
     attributions = build_attribution_summary(db, "college", college_id)
-    key_indicators = build_key_indicators_comparison(db, "college", college_id)
+    key_indicators = build_key_indicators_comparison(
+        db, "college", college_id, scope=scope
+    )
 
     micro_major_count = len(college.micro_majors) if college.micro_majors else 0
 

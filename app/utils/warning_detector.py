@@ -32,15 +32,23 @@ def calculate_yearly_indicators(
     db: Session,
     target_type: str,
     target_id: int,
+    scope=None,
 ) -> List[Dict]:
-    years = db.query(Graduate.graduation_year).distinct().order_by(
-        Graduate.graduation_year
-    ).all()
-    years = [y[0] for y in years]
+    year_query = db.query(Graduate.graduation_year)
+    if scope is not None:
+        year_query = scope.graduate_base_query(db).with_entities(Graduate.graduation_year)
+    years = [
+        y[0]
+        for y in year_query.distinct().order_by(Graduate.graduation_year).all()
+    ]
 
     yearly_data = []
     for year in years:
-        query = db.query(Graduate).filter(Graduate.graduation_year == year)
+        if scope is not None:
+            query = scope.graduate_base_query(db)
+        else:
+            query = db.query(Graduate)
+        query = query.filter(Graduate.graduation_year == year)
 
         if target_type == "micro_major":
             query = query.filter(

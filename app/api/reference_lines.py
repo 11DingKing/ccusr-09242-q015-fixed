@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core import get_db
+from app.core.security import AccessScope, require_read_scope, require_school_scope
 from app.models import ProvinceReferenceLine
 from app.schemas import (
     ProvinceReferenceLine as ProvinceReferenceLineSchema,
@@ -18,6 +19,7 @@ def list_reference_lines(
     graduation_year: Optional[int] = Query(None, description="毕业届次"),
     indicator: Optional[str] = Query(None, description="指标名称"),
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
     query = db.query(ProvinceReferenceLine)
 
@@ -33,7 +35,11 @@ def list_reference_lines(
 
 
 @router.get("/{reference_line_id}", response_model=ProvinceReferenceLineSchema)
-def get_reference_line(reference_line_id: int, db: Session = Depends(get_db)):
+def get_reference_line(
+    reference_line_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
     reference_line = db.query(ProvinceReferenceLine).filter(ProvinceReferenceLine.id == reference_line_id).first()
     if not reference_line:
         raise HTTPException(status_code=404, detail="基准线不存在")
@@ -44,7 +50,9 @@ def get_reference_line(reference_line_id: int, db: Session = Depends(get_db)):
 def create_reference_line(
     reference_line_in: ProvinceReferenceLineCreate,
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
+    require_school_scope(scope)
     existing = db.query(ProvinceReferenceLine).filter(
         ProvinceReferenceLine.graduation_year == reference_line_in.graduation_year,
         ProvinceReferenceLine.indicator == reference_line_in.indicator,
@@ -64,7 +72,9 @@ def update_reference_line(
     reference_line_id: int,
     reference_line_in: ProvinceReferenceLineUpdate,
     db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
 ):
+    require_school_scope(scope)
     reference_line = db.query(ProvinceReferenceLine).filter(ProvinceReferenceLine.id == reference_line_id).first()
     if not reference_line:
         raise HTTPException(status_code=404, detail="基准线不存在")
@@ -79,7 +89,12 @@ def update_reference_line(
 
 
 @router.delete("/{reference_line_id}")
-def delete_reference_line(reference_line_id: int, db: Session = Depends(get_db)):
+def delete_reference_line(
+    reference_line_id: int,
+    db: Session = Depends(get_db),
+    scope: AccessScope = Depends(require_read_scope),
+):
+    require_school_scope(scope)
     reference_line = db.query(ProvinceReferenceLine).filter(ProvinceReferenceLine.id == reference_line_id).first()
     if not reference_line:
         raise HTTPException(status_code=404, detail="基准线不存在")

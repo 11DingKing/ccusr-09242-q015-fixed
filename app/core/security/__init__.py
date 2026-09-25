@@ -1,0 +1,62 @@
+"""统一访问控制边界：角色、授权范围、越权审计。"""
+
+from .roles import Role, ROLE_HEADER, COLLEGE_HEADER, WRITE_ROLES
+from .access_scope import (
+    AccessScope,
+    AccessDenied,
+    ScopeViolation,
+    require_college,
+    require_micro_major,
+    require_graduate,
+    require_target,
+    require_warning,
+    warning_in_scope,
+    accessible_warning_ids,
+)
+from .audit import AuditLog, AuditEntry, audit_log
+from .deps import (
+    ReportScopeKey,
+    require_read_scope,
+    require_school_scope,
+    enforce_query_filters,
+    ensure_college_accessible,
+    ensure_micro_major_accessible,
+    ensure_warning_accessible,
+    ensure_target_accessible,
+    ensure_graduate_accessible,
+    mint_report_link,
+    verify_report_link,
+    audit_scope_violation,
+)
+
+__all__ = [
+    "Role",
+    "ROLE_HEADER",
+    "COLLEGE_HEADER",
+    "WRITE_ROLES",
+    "AccessScope",
+    "AccessDenied",
+    "ScopeViolation",
+    "require_college",
+    "require_micro_major",
+    "require_graduate",
+    "require_target",
+    "require_warning",
+    "warning_in_scope",
+    "accessible_warning_ids",
+    "AuditLog",
+    "AuditEntry",
+    "audit_log",
+    "ReportScopeKey",
+    "require_read_scope",
+    "require_school_scope",
+    "enforce_query_filters",
+    "ensure_college_accessible",
+    "ensure_micro_major_accessible",
+    "ensure_warning_accessible",
+    "ensure_target_accessible",
+    "ensure_graduate_accessible",
+    "mint_report_link",
+    "verify_report_link",
+    "audit_scope_violation",
+]
