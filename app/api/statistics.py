@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 from collections import Counter
 
-from app.core import get_db
+from app.core import get_db, get_access_context, record_audit, deny_request
 from app.models import (
     Graduate,
     College,
@@ -33,6 +33,14 @@ from app.schemas import (
     AttributionDistributionResponse,
     AttributionDistributionItem,
 )
+from app.services.access_control import (
+    AccessContext,
+    AccessDeniedError,
+    assert_micro_major_allowed,
+    graduate_scope_condition,
+    resolve_college_scope,
+    warning_scope_condition,
+)
 from app.utils import (
     get_comparison_stats,
     get_follow_up_comparison,
@@ -54,11 +62,24 @@ def get_group_comparison(
     college_id: Optional[int] = Query(None, description="学院ID"),
     micro_major_id: Optional[int] = Query(None, description="微专业ID"),
     db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
 ):
+    action = "statistics.comparison"
+    params = {"graduation_year": graduation_year, "college_id": college_id, "micro_major_id": micro_major_id}
+    try:
+        college_scope = resolve_college_scope(ctx, college_id)
+        if micro_major_id is not None:
+            assert_micro_major_allowed(db, ctx, micro_major_id)
+    except AccessDeniedError as exc:
+        deny_request(db, ctx, action, "/statistics/comparison", params, exc)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="微专业不存在")
+
+    record_audit(db, ctx, action, "/statistics/comparison", params)
     return get_comparison_stats(
         db=db,
         graduation_year=graduation_year,
-        college_id=college_id,
+        college_ids=college_scope,
         micro_major_id=micro_major_id
     )
 
@@ -69,11 +90,24 @@ def get_follow_up_group_comparison(
     college_id: Optional[int] = Query(None, description="学院ID"),
     micro_major_id: Optional[int] = Query(None, description="微专业ID"),
     db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
 ):
+    action = "statistics.follow_up_comparison"
+    params = {"graduation_year": graduation_year, "college_id": college_id, "micro_major_id": micro_major_id}
+    try:
+        college_scope = resolve_college_scope(ctx, college_id)
+        if micro_major_id is not None:
+            assert_micro_major_allowed(db, ctx, micro_major_id)
+    except AccessDeniedError as exc:
+        deny_request(db, ctx, action, "/statistics/follow-up-comparison", params, exc)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="微专业不存在")
+
+    record_audit(db, ctx, action, "/statistics/follow-up-comparison", params)
     return get_follow_up_comparison(
         db=db,
         graduation_year=graduation_year,
-        college_id=college_id,
+        college_ids=college_scope,
         micro_major_id=micro_major_id,
     )
 
@@ -83,9 +117,15 @@ def get_yearly_trend(
     micro_major_id: int,
     run_detection: bool = Query(False, description="是否先运行预警检测"),
     db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
 ):
-    micro_major = db.query(MicroMajor).filter(MicroMajor.id == micro_major_id).first()
-    if not micro_major:
+    action = "statistics.trend"
+    params = {"micro_major_id": micro_major_id}
+    try:
+        micro_major = assert_micro_major_allowed(db, ctx, micro_major_id)
+    except AccessDeniedError as exc:
+        deny_request(db, ctx, action, "/statistics/trend", params, exc)
+    except LookupError:
         raise HTTPException(status_code=404, detail="微专业不存在")
 
     if run_detection:
@@ -105,11 +145,14 @@ def get_yearly_trend(
     yearly_indicators = calculate_yearly_indicators(db, "micro_major", micro_major_id)
     indicator_map = {d["year"]: d for d in yearly_indicators}
 
+    scope_condition = graduate_scope_condition(ctx)
+
     trend = []
     for year in years:
-        all_graduates = db.query(Graduate).filter(
-            Graduate.graduation_year == year
-        ).all()
+        year_query = db.query(Graduate).filter(Graduate.graduation_year == year)
+        if scope_condition is not None:
+            year_query = year_query.filter(scope_condition)
+        all_graduates = year_query.all()
 
         with_micro = [
             g for g in all_graduates
@@ -153,6 +196,7 @@ def get_yearly_trend(
             aligned_rate=indicator.get("aligned_rate", 0.0),
         ))
 
+    record_audit(db, ctx, action, "/statistics/trend", params)
     return YearlyTrendResponse(
         micro_major_name=micro_major.name,
         trend=trend,
@@ -162,8 +206,14 @@ def get_yearly_trend(
 
 
 @router.get("/reports/by-college", response_model=ReportResponse)
-def get_report_by_college(db: Session = Depends(get_db)):
-    colleges = db.query(College).all()
+def get_report_by_college(
+    db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
+):
+    college_query = db.query(College)
+    if not ctx.is_school_wide:
+        college_query = college_query.filter(College.id.in_(ctx.allowed_college_ids))
+    colleges = college_query.all()
     data = []
 
     for college in colleges:
@@ -185,6 +235,7 @@ def get_report_by_college(db: Session = Depends(get_db)):
             follow_up_count=stats.follow_up_count,
         ))
 
+    record_audit(db, ctx, "statistics.report_by_college", "/statistics/reports/by-college")
     return ReportResponse(
         report_type="按学院统计",
         data=data,
@@ -193,13 +244,22 @@ def get_report_by_college(db: Session = Depends(get_db)):
 
 
 @router.get("/reports/by-micro-major", response_model=ReportResponse)
-def get_report_by_micro_major(db: Session = Depends(get_db)):
-    micro_majors = db.query(MicroMajor).all()
+def get_report_by_micro_major(
+    db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
+):
+    scope_condition = graduate_scope_condition(ctx)
+
+    mm_query = db.query(MicroMajor)
+    if not ctx.is_school_wide:
+        mm_query = mm_query.filter(MicroMajor.college_id.in_(ctx.allowed_college_ids))
+    micro_majors = mm_query.all()
     data = []
 
-    all_without_micro = db.query(Graduate).filter(
-        Graduate.has_micro_major == False
-    ).all()
+    without_micro_query = db.query(Graduate).filter(Graduate.has_micro_major == False)
+    if scope_condition is not None:
+        without_micro_query = without_micro_query.filter(scope_condition)
+    all_without_micro = without_micro_query.all()
     _eager_load_follow_ups(db, all_without_micro)
     stats_all = calculate_group_stats(all_without_micro)
     data.append(ReportItem(
@@ -234,6 +294,7 @@ def get_report_by_micro_major(db: Session = Depends(get_db)):
             follow_up_count=stats.follow_up_count,
         ))
 
+    record_audit(db, ctx, "statistics.report_by_micro_major", "/statistics/reports/by-micro-major")
     return ReportResponse(
         report_type="按微专业统计",
         data=data,
@@ -242,17 +303,24 @@ def get_report_by_micro_major(db: Session = Depends(get_db)):
 
 
 @router.get("/reports/by-year", response_model=ReportResponse)
-def get_report_by_year(db: Session = Depends(get_db)):
-    years = db.query(Graduate.graduation_year).distinct().order_by(
-        Graduate.graduation_year
-    ).all()
+def get_report_by_year(
+    db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
+):
+    scope_condition = graduate_scope_condition(ctx)
+
+    year_query = db.query(Graduate.graduation_year).distinct()
+    if scope_condition is not None:
+        year_query = year_query.filter(scope_condition)
+    years = year_query.order_by(Graduate.graduation_year).all()
     years = [y[0] for y in years]
     data = []
 
     for year in years:
-        graduates = db.query(Graduate).filter(
-            Graduate.graduation_year == year
-        ).all()
+        graduates_query = db.query(Graduate).filter(Graduate.graduation_year == year)
+        if scope_condition is not None:
+            graduates_query = graduates_query.filter(scope_condition)
+        graduates = graduates_query.all()
         _eager_load_follow_ups(db, graduates)
 
         stats = calculate_group_stats(graduates)
@@ -268,6 +336,7 @@ def get_report_by_year(db: Session = Depends(get_db)):
             follow_up_count=stats.follow_up_count,
         ))
 
+    record_audit(db, ctx, "statistics.report_by_year", "/statistics/reports/by-year")
     return ReportResponse(
         report_type="按届次统计",
         data=data,
@@ -276,10 +345,18 @@ def get_report_by_year(db: Session = Depends(get_db)):
 
 
 @router.get("/reports/by-employer-follow-up", response_model=ReportResponse)
-def get_report_by_employer_follow_up(db: Session = Depends(get_db)):
-    employed_graduates = db.query(Graduate).filter(
+def get_report_by_employer_follow_up(
+    db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
+):
+    scope_condition = graduate_scope_condition(ctx)
+
+    employed_query = db.query(Graduate).filter(
         Graduate.destination_type == DestinationType.EMPLOYMENT
-    ).all()
+    )
+    if scope_condition is not None:
+        employed_query = employed_query.filter(scope_condition)
+    employed_graduates = employed_query.all()
     _eager_load_follow_ups(db, employed_graduates)
 
     with_micro = [g for g in employed_graduates if g.has_micro_major]
@@ -313,6 +390,7 @@ def get_report_by_employer_follow_up(db: Session = Depends(get_db)):
         ),
     ]
 
+    record_audit(db, ctx, "statistics.report_by_employer_follow_up", "/statistics/reports/by-employer-follow-up")
     return ReportResponse(
         report_type="用人单位回访对照统计",
         data=data,
@@ -327,12 +405,23 @@ def get_warning_report(
     target_type: Optional[str] = Query(None, description="预警对象类型：micro_major/college"),
     run_detection: bool = Query(False, description="是否先运行全量预警检测"),
     db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
 ):
     if run_detection:
         from app.utils import run_full_warning_detection
+        if not ctx.is_school_wide:
+            deny_request(
+                db, ctx, "statistics.warning_report_detect", "/statistics/reports/warnings",
+                {"run_detection": True},
+                AccessDeniedError("全量预警检测仅校级可用"),
+            )
         run_full_warning_detection(db)
 
+    scope_condition = warning_scope_condition(db, ctx)
+
     query = db.query(Warning)
+    if scope_condition is not None:
+        query = query.filter(scope_condition)
 
     if status:
         query = query.filter(Warning.status == status)
@@ -346,8 +435,11 @@ def get_warning_report(
         Warning.created_at.desc(),
     ).all()
 
-    active_count = db.query(Warning).filter(Warning.status == WarningStatus.ACTIVE).count()
-    resolved_count = db.query(Warning).filter(Warning.status == WarningStatus.RESOLVED).count()
+    count_query = db.query(Warning)
+    if scope_condition is not None:
+        count_query = count_query.filter(scope_condition)
+    active_count = count_query.filter(Warning.status == WarningStatus.ACTIVE).count()
+    resolved_count = count_query.filter(Warning.status == WarningStatus.RESOLVED).count()
 
     data = []
     for w in warnings:
@@ -374,6 +466,7 @@ def get_warning_report(
             created_at=w.created_at,
         ))
 
+    record_audit(db, ctx, "statistics.warning_report", "/statistics/reports/warnings")
     return WarningListResponse(
         total=len(warnings),
         active_count=active_count,
@@ -386,11 +479,18 @@ def get_warning_report(
 def get_attribution_distribution_report(
     target_type: Optional[str] = Query(None, description="对象类型：micro_major/college"),
     db: Session = Depends(get_db),
+    ctx: AccessContext = Depends(get_access_context),
 ):
+    scope_condition = warning_scope_condition(db, ctx)
+
     query = db.query(AttributionRecord)
 
+    warning_query = db.query(Warning.id)
+    if scope_condition is not None:
+        warning_query = warning_query.filter(scope_condition)
     if target_type:
-        warning_query = db.query(Warning.id).filter(Warning.target_type == target_type)
+        warning_query = warning_query.filter(Warning.target_type == target_type)
+    if scope_condition is not None or target_type:
         warning_ids = [w[0] for w in warning_query.all()]
         if warning_ids:
             query = query.filter(AttributionRecord.warning_id.in_(warning_ids))
@@ -444,6 +544,7 @@ def get_attribution_distribution_report(
             "attribution_count": count,
         })
 
+    record_audit(db, ctx, "statistics.attribution_distribution", "/statistics/reports/attribution-distribution")
     return AttributionDistributionResponse(
         total_records=total_records,
         distribution=distribution,

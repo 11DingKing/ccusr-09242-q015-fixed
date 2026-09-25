@@ -54,6 +54,11 @@ class WarningStatus(str, enum.Enum):
     DISMISSED = "已忽略"
 
 
+class UserRole(str, enum.Enum):
+    SCHOOL_ADMIN = "校级管理员"
+    COLLEGE_STAFF = "学院用户"
+
+
 INDUSTRIES = [
     "信息技术",
     "金融",

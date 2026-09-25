@@ -18,6 +18,9 @@ from app.models import (
     SalaryRange,
     SalaryChange,
     INDUSTRIES,
+    UserAccount,
+    UserCollegeGrant,
+    UserRole,
 )
 
 
@@ -320,6 +323,48 @@ def init_province_reference_lines(db):
     return count
 
 
+def init_users(db, colleges):
+    """初始化演示账号：一个校级管理员 + 每个学院一个复核账号。
+
+    演示环境使用固定令牌，调用接口时通过 X-Access-Token 请求头携带。
+    """
+    if not db.query(UserAccount).filter(UserAccount.username == "school_admin").first():
+        db.add(UserAccount(
+            username="school_admin",
+            display_name="校级管理员",
+            role=UserRole.SCHOOL_ADMIN,
+            api_token="school-admin-token",
+        ))
+    db.commit()
+
+    created = 0
+    for code, college in colleges.items():
+        username = f"college_{code.lower()}"
+        user = db.query(UserAccount).filter(UserAccount.username == username).first()
+        if not user:
+            user = UserAccount(
+                username=username,
+                display_name=f"{college.name}复核员",
+                role=UserRole.COLLEGE_STAFF,
+                api_token=f"college-{code.lower()}-token",
+            )
+            db.add(user)
+            db.flush()
+            created += 1
+        has_grant = db.query(UserCollegeGrant).filter(
+            UserCollegeGrant.user_id == user.id,
+            UserCollegeGrant.college_id == college.id,
+        ).first()
+        if not has_grant:
+            db.add(UserCollegeGrant(
+                user_id=user.id,
+                college_id=college.id,
+                granted_by="school_admin",
+            ))
+    db.commit()
+    return created
+
+
 def main():
     print("=" * 60)
     print("正在初始化数据库...")
@@ -361,6 +406,11 @@ def main():
         print("\n5. 正在初始化省基准线数据...")
         bench_count = init_province_reference_lines(db)
         print(f"   已初始化 {bench_count} 条省基准线数据")
+
+        print("\n6. 正在初始化演示账号与学院授权...")
+        user_count = init_users(db, colleges)
+        print(f"   校级管理员: school_admin (令牌 school-admin-token)")
+        print(f"   新创建学院账号: {user_count} 个 (令牌形如 college-cs-token)")
 
         print("\n" + "=" * 60)
         print("数据初始化完成！")

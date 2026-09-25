@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import Collection, List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
@@ -91,24 +91,34 @@ def calculate_group_stats(graduates: List[Graduate]) -> GroupStats:
     )
 
 
-def get_comparison_stats(
+def _scoped_graduates(
     db: Session,
-    graduation_year: int = None,
-    college_id: int = None,
-    micro_major_id: int = None
-) -> ComparisonStats:
+    graduation_year: Optional[int],
+    college_ids: Optional[Collection[int]],
+) -> List[Graduate]:
+    """按届次与学院范围集合取出毕业生，college_ids 为 None 表示不限制。"""
+
     query = db.query(Graduate)
 
     filters = []
     if graduation_year:
         filters.append(Graduate.graduation_year == graduation_year)
-    if college_id:
-        filters.append(Graduate.college_id == college_id)
+    if college_ids is not None:
+        filters.append(Graduate.college_id.in_(college_ids))
 
     if filters:
         query = query.filter(and_(*filters))
 
-    all_graduates = query.all()
+    return query.all()
+
+
+def get_comparison_stats(
+    db: Session,
+    graduation_year: int = None,
+    college_ids: Optional[Collection[int]] = None,
+    micro_major_id: int = None
+) -> ComparisonStats:
+    all_graduates = _scoped_graduates(db, graduation_year, college_ids)
 
     _eager_load_follow_ups(db, all_graduates)
 
@@ -134,21 +144,10 @@ def get_comparison_stats(
 def get_follow_up_comparison(
     db: Session,
     graduation_year: int = None,
-    college_id: int = None,
+    college_ids: Optional[Collection[int]] = None,
     micro_major_id: int = None
 ) -> FollowUpComparisonStats:
-    query = db.query(Graduate)
-
-    filters = []
-    if graduation_year:
-        filters.append(Graduate.graduation_year == graduation_year)
-    if college_id:
-        filters.append(Graduate.college_id == college_id)
-
-    if filters:
-        query = query.filter(and_(*filters))
-
-    all_graduates = query.all()
+    all_graduates = _scoped_graduates(db, graduation_year, college_ids)
 
     _eager_load_follow_ups(db, all_graduates)
 

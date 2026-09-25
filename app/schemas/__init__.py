@@ -54,6 +54,9 @@ from .profile import (
     MicroMajorProfile,
     CollegeProfile,
 )
+from .user import UserAccount, UserAccountCreate, UserCollegeGrant, UserGrantUpdate
+from .share_link import ShareLink, ShareLinkCreate
+from .audit_log import AuditLog
 
 __all__ = [
     "BaseSchema",
@@ -104,4 +107,11 @@ __all__ = [
     "KeyIndicatorsComparison",
     "MicroMajorProfile",
     "CollegeProfile",
+    "UserAccount",
+    "UserAccountCreate",
+    "UserCollegeGrant",
+    "UserGrantUpdate",
+    "ShareLink",
+    "ShareLinkCreate",
+    "AuditLog",
 ]
